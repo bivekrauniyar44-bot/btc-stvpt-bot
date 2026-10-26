@@ -1,0 +1,89 @@
+
+from flask import Flask, request, render_template_string
+from bot import PaperBot
+
+app = Flask(__name__)
+bot = PaperBot()
+
+PAGE = """
+<!doctype html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BTC STVPT Paper Bot</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 620px;
+           margin: 25px auto; padding: 15px; }
+    .card { border: 1px solid #ddd; border-radius: 12px;
+            padding: 16px; margin: 12px 0; }
+    input, select, button { width: 100%; padding: 12px;
+            margin: 7px 0; box-sizing: border-box; }
+    button { cursor: pointer; }
+    .warning { color: #a33; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h2>BTCUSDT STVPT Bot</h2>
+  <div class="card">
+    <p class="warning">PAPER MODE ONLY — NO REAL ORDERS</p>
+    <p>Position: {{ status.position }}</p>
+    <p>Entry price: {{ status.entry_price }}</p>
+    <p>Paper stake: ${{ status.stake }}</p>
+    <p>Consecutive losses: {{ status.loss_streak }}</p>
+    <p>Closed trades: {{ status.closed_trades }}</p>
+    <p>Maximum stake: ${{ status.max_stake }}</p>
+  </div>
+
+  <div class="card">
+    <h3>Test a signal manually</h3>
+    <form method="post" action="/signal">
+      <label>Main STVPT color</label>
+      <select name="main">
+        <option value="green">Green</option>
+        <option value="red">Red</option>
+      </select>
+      <label>Fast STVPT color</label>
+      <select name="fast">
+        <option value="green">Green</option>
+        <option value="red">Red</option>
+      </select>
+      <label>Test price</label>
+      <input name="price" type="number" step="any"
+             min="0.00000001" required placeholder="e.g. 67000">
+      <button type="submit">Test paper signal</button>
+    </form>
+    {% if message %}<p><b>{{ message }}</b></p>{% endif %}
+  </div>
+
+  <p>This dashboard uses manually entered signals.
+  It does not receive live candles or calculate STVPT yet.</p>
+</body>
+</html>
+"""
+
+@app.route("/", methods=["GET"])
+def home():
+    return render_template_string(
+        PAGE, status=bot.status(), message=""
+    )
+
+@app.route("/signal", methods=["POST"])
+def signal():
+    try:
+        price = float(request.form["price"])
+        if price <= 0:
+            raise ValueError("Price must be positive")
+        message = bot.process_signal(
+            request.form["main"],
+            request.form["fast"],
+            price
+        )
+    except (ValueError, TypeError):
+        message = "Invalid price. Please enter a positive number."
+
+    return render_template_string(
+        PAGE, status=bot.status(), message=message
+    )
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
