@@ -6,24 +6,33 @@ from datetime import datetime, timezone
 
 BINANCE_URL = "https://data-api.binance.vision/api/v3/klines"
 
+# Your TradingView STVPT settings
+CANDLE_LIMIT = 3000
+STVPT_LENGTH = 2000
+SUPERTREND_PERIOD = 100
+MAIN_MULTIPLIER = 5.0
+FAST_MULTIPLIER = 0.5
 
-def get_btc_candles(limit=3000):
-    candles = []
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+def get_btc_candles(limit=CANDLE_LIMIT):
+    """Fetch historical BTCUSDT one-minute candles from Binance."""
+    rows_all = []
     end_time = None
 
-    # Binance allows at most 1000 candles per request.
-    while len(candles) < limit:
+    while len(rows_all) < limit:
         params = {
             "symbol": "BTCUSDT",
             "interval": "1m",
-            "limit": min(1000, limit - len(candles)),
+            "limit": min(1000, limit - len(rows_all)),
         }
+
         if end_time is not None:
             params["endTime"] = end_time
 
         response = requests.get(
-            BINANCE_URL, params=params, timeout=20
+            BINANCE_URL,
+            params=params,
+            timeout=20,
         )
         response.raise_for_status()
         rows = response.json()
@@ -31,17 +40,18 @@ def get_btc_candles(limit=3000):
         if not rows:
             break
 
-        candles = rows + candles
+        rows_all = rows + rows_all
         end_time = rows[0][0] - 1
 
         if len(rows) < 1000:
             break
 
-    # Remove any duplicates and keep chronological order.
-    unique_rows = {row[0]: row for row in candles}
-    candles = [
+    unique_rows = {row[0]: row for row in rows_all}
+    rows_all = [
         unique_rows[t] for t in sorted(unique_rows)
     ][-limit:]
+
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
     return [
         {
@@ -55,27 +65,103 @@ def get_btc_candles(limit=3000):
             "volume": float(row[5]),
             "closed": int(row[6]) < now_ms,
         }
-        for row in candles
+        for row in rows_all
     ]
 
 
-def calculate_stvpt(candles, multiplier, period=100, length=2000):
-    df = pd.DataFrame(candles)
+def pine_ema(series, length):
+    """EMA with Pine-style SMA initialization."""
+    result = pd.Series(np.nan, index=series.index, dtype=float)
+
+    valid = series.first_valid_index()
+    if valid is None:
+        return result
+
+    start = series.index.get_loc(valid)
+    alpha = 2.0 / (length + 1.0)
+
+    seed_end = start + length
+    if seed_end > len(series):
+        return result
+
+    seed_values = series.iloc[start:seed_end]
+    if seed_values.isna().any():
+        return result
+
+    result.iloc[seed_end - 1] = seed_values.mean()
+
+    for i in range(seed_end, len(series)):
+        value = series.iloc[i]
+        previous = result.iloc[i - 1]
+
+        if pd.isna(value) or pd.isna(previous):
+            result.iloc[i] = np.nan
+        else:
+            result.iloc[i] = alpha * value + (1 - alpha) * previous
+
+    return result
+
+
+def pine_rma(series, length):
+    """Wilder's RMA, used by TradingView ATR."""
+    result = pd.Series(np.nan, index=series.index, dtype=float)
+
+    valid = series.first_valid_index()
+    if valid is None:
+        return result
+
+    start = series.index.get_loc(valid)
+    seed_end = start + length
+
+    if seed_end > len(series):
+        return result
+
+    seed_values = series.iloc[start:seed_end]
+    if seed_values.isna().any():
+        return result
+
+    result.iloc[seed_end - 1] = seed_values.mean()
+
+    for i in range(seed_end, len(series)):
+        value = series.iloc[i]
+        previous = result.iloc[i - 1]
+
+        if pd.isna(value) or pd.isna(previous):
+            result.iloc[i] = np.nan
+        else:
+            result.iloc[i] = (
+                previous * (length - 1) + value
+            ) / length
+
+    return result
+
+
+def calculate_stvpt(
+    candles,
+    multiplier,
+    period=SUPERTREND_PERIOD,
+    length=STVPT_LENGTH,
+):
+    """Calculate diagnostic STVPT values from closed candles."""
+    df = pd.DataFrame(candles).reset_index(drop=True)
 
     high = df["high"]
     low = df["low"]
     close = df["close"]
+    open_price = df["open"]
     volume = df["volume"]
 
     hilow = (high - low) * 100
-    openclose = (close - df["open"]) * 100
+    openclose = (close - open_price) * 100
 
     vol = volume.div(hilow.replace(0, np.nan))
     spreadvol = (openclose * vol).replace(
         [np.inf, -np.inf], np.nan
     ).fillna(0)
 
+    # Preserve the cumulative VPT-style calculation.
     v = spreadvol.cumsum()
+
     smooth = v.rolling(14, min_periods=14).mean()
 
     price_spread = (high - low).rolling(
@@ -99,27 +185,26 @@ def calculate_stvpt(candles, multiplier, period=100, length=2000):
         index=df.index,
     )
 
-    vpt = out.ewm(
-        span=length, adjust=False, min_periods=length
-    ).mean()
+    vpt = pine_ema(out, length)
 
     previous_close = close.shift(1)
 
-    true_range = pd.concat([
-        high - low,
-        (high - previous_close).abs(),
-        (low - previous_close).abs(),
-    ], axis=1).max(axis=1)
+    true_range = pd.concat(
+        [
+            high - low,
+            (high - previous_close).abs(),
+            (low - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
 
-    atr = true_range.ewm(
-        alpha=1 / period, adjust=False, min_periods=period
-    ).mean()
+    atr = pine_rma(true_range, period)
 
     up_lev = vpt - multiplier * atr
     dn_lev = vpt + multiplier * atr
 
-    up_trend = pd.Series(np.nan, index=df.index)
-    down_trend = pd.Series(np.nan, index=df.index)
+    up_trend = pd.Series(np.nan, index=df.index, dtype=float)
+    down_trend = pd.Series(np.nan, index=df.index, dtype=float)
     trend = pd.Series(0, index=df.index, dtype=int)
 
     for i in range(len(df)):
@@ -132,35 +217,57 @@ def calculate_stvpt(candles, multiplier, period=100, length=2000):
         prev_up = up_trend.iloc[i - 1]
         prev_down = down_trend.iloc[i - 1]
 
+        current_up = up_lev.iloc[i]
+        current_down = dn_lev.iloc[i]
+
+        if pd.isna(current_up) or pd.isna(current_down):
+            up_trend.iloc[i] = current_up
+            down_trend.iloc[i] = current_down
+            trend.iloc[i] = trend.iloc[i - 1]
+            continue
+
         up_trend.iloc[i] = (
-            max(up_lev.iloc[i], prev_up)
+            max(current_up, prev_up)
             if close.iloc[i - 1] > prev_up
-            else up_lev.iloc[i]
+            else current_up
         )
 
         down_trend.iloc[i] = (
-            min(dn_lev.iloc[i], prev_down)
+            min(current_down, prev_down)
             if close.iloc[i - 1] < prev_down
-            else dn_lev.iloc[i]
+            else current_down
         )
 
-        if close.iloc[i] > down_trend.iloc[i - 1]:
+        if close.iloc[i] > prev_down:
             trend.iloc[i] = 1
-        elif close.iloc[i] < up_trend.iloc[i - 1]:
+        elif close.iloc[i] < prev_up:
             trend.iloc[i] = -1
         else:
             trend.iloc[i] = trend.iloc[i - 1]
 
-    last_trend = int(trend.iloc[-1])
-    last_line = (
-        up_trend.iloc[-1] if last_trend == 1
-        else down_trend.iloc[-1]
-    )
+    last_i = len(df) - 1
+    previous_i = last_i - 1
 
+    def line_at(i, direction):
+        value = (
+            up_trend.iloc[i]
+            if direction == 1
+            else down_trend.iloc[i]
+        )
+        return float(value) if pd.notna(value) else None
+
+    current_trend = int(trend.iloc[last_i])
+    previous_trend = int(trend.iloc[previous_i])
+
+    # Pine plots st_line[1] but colors it with the current trend.
     return {
-        "trend": last_trend,
-        "color": "GREEN" if last_trend == 1 else "RED",
-        "line": float(last_line) if pd.notna(last_line) else None,
+        "trend": current_trend,
+        "color": "GREEN" if current_trend == 1 else "RED",
+        "line": line_at(last_i, current_trend),
+        "plotted_line": line_at(previous_i, previous_trend),
+        "plotted_color": (
+            "GREEN" if current_trend == 1 else "RED"
+        ),
         "multiplier": multiplier,
         "period": period,
         "ema_length": length,
@@ -169,7 +276,8 @@ def calculate_stvpt(candles, multiplier, period=100, length=2000):
 
 def get_market_status():
     try:
-        candles = get_btc_candles(limit=3000)
+        candles = get_btc_candles(CANDLE_LIMIT)
+
         closed_candles = [
             candle for candle in candles if candle["closed"]
         ]
@@ -179,17 +287,17 @@ def get_market_status():
                 "status": "waiting",
                 "mode": "PAPER ONLY",
                 "closed_candles_received": len(closed_candles),
-                "message": (
-                    "Waiting for at least 2200 closed candles "
-                    "for EMA 2000 calculations."
-                ),
+                "message": "Waiting for at least 2200 closed candles.",
             }
 
         main = calculate_stvpt(
-            closed_candles, multiplier=5, period=100, length=2000
+            closed_candles,
+            multiplier=MAIN_MULTIPLIER,
         )
+
         fast = calculate_stvpt(
-            closed_candles, multiplier=0.5, period=100, length=2000
+            closed_candles,
+            multiplier=FAST_MULTIPLIER,
         )
 
         return {
@@ -203,8 +311,8 @@ def get_market_status():
             "main_stvpt": main,
             "fast_stvpt": fast,
             "note": (
-                "Diagnostic only; not yet verified against "
-                "TradingView. No trades are placed."
+                "Diagnostic only; exact TradingView parity is "
+                "not confirmed. No trades are placed."
             ),
         }
 
