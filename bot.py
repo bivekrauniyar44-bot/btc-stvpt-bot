@@ -1,72 +1,55 @@
 
-class PaperBot:
-    def __init__(self):
-        self.position = None
-        self.entry_price = None
-        self.stake = 1
-        self.loss_streak = 0
-        self.max_stake = 4
-        self.log = []
+import requests
+from datetime import datetime, timezone
 
-    def process_signal(self, main_color, fast_color, price):
-        main_color = main_color.lower()
-        fast_color = fast_color.lower()
-        action = "WAIT"
+BINANCE_URL = "https://api.binance.com/api/v3/klines"
 
-        if main_color not in ("green", "red"):
-            return "WAIT: invalid main signal"
+def get_btc_candles(limit=1000):
+    response = requests.get(
+        BINANCE_URL,
+        params={
+            "symbol": "BTCUSDT",
+            "interval": "1m",
+            "limit": limit,
+        },
+        timeout=15,
+    )
+    response.raise_for_status()
+    rows = response.json()
 
-        if fast_color not in ("green", "red"):
-            return "WAIT: invalid stop signal"
+    return [
+        {
+            "time": datetime.fromtimestamp(
+                row[0] / 1000, tz=timezone.utc
+            ).isoformat(),
+            "open": float(row[1]),
+            "high": float(row[2]),
+            "low": float(row[3]),
+            "close": float(row[4]),
+            "volume": float(row[5]),
+            "closed": row[6] < int(datetime.now(
+                timezone.utc
+            ).timestamp() * 1000),
+        }
+        for row in rows
+    ]
 
-        if self.position is None:
-            # Enter only when both indicators agree.
-            if main_color == "green" and fast_color == "green":
-                self.position = "BUY"
-                self.entry_price = float(price)
-                action = "PAPER BUY"
-            elif main_color == "red" and fast_color == "red":
-                self.position = "SELL"
-                self.entry_price = float(price)
-                action = "PAPER SELL"
-        else:
-            # The faster indicator changing color closes the paper position.
-            stop_hit = (
-                (self.position == "BUY" and fast_color == "red")
-                or (self.position == "SELL" and fast_color == "green")
-            )
-
-            if stop_hit:
-                self.log.append({
-                    "position": self.position,
-                    "entry": self.entry_price,
-                    "exit": float(price),
-                    "stake": self.stake,
-                    "result": "CLOSED - P&L not yet calculated"
-                })
-                self.position = None
-                self.entry_price = None
-                action = "PAPER CLOSE"
-
-        return action
-
-    def record_result(self, won):
-        # Call only after a paper trade has actually been evaluated.
-        if won:
-            self.loss_streak = 0
-            self.stake = 1
-        else:
-            self.loss_streak += 1
-            if self.loss_streak % 3 == 0:
-                self.stake = min(self.stake + 1, self.max_stake)
-
-    def status(self):
+def get_market_status():
+    try:
+        candles = get_btc_candles()
         return {
+            "status": "ok",
             "mode": "PAPER ONLY",
-            "position": self.position or "NONE",
-            "entry_price": self.entry_price,
-            "stake": self.stake,
-            "loss_streak": self.loss_streak,
-            "max_stake": self.max_stake,
-            "closed_trades": len(self.log)
+            "symbol": "BTCUSDT",
+            "interval": "1m",
+            "candles_received": len(candles),
+            "latest_close": candles[-1]["close"],
+            "latest_candle_time": candles[-1]["time"],
+            "note": "Market data only; no trades are placed.",
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "mode": "PAPER ONLY",
+            "error": str(exc),
         }
